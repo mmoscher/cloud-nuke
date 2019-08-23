@@ -13,9 +13,17 @@ import (
 	"github.com/aws/aws-sdk-go/service/ec2"
 	"github.com/aws/aws-sdk-go/service/ecs"
 	"github.com/aws/aws-sdk-go/service/iam"
+	"github.com/gruntwork-io/gruntwork-cli/collections"
 	gruntworkerrors "github.com/gruntwork-io/gruntwork-cli/errors"
+	"github.com/gruntwork-io/terratest/modules/retry"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/gruntwork-io/cloud-nuke/logging"
 )
+
+// We black list us-east-1e because this zone is frequently out of capacity
+var AvailabilityZoneBlackList = []string{"us-east-1e"}
 
 // getRandomFargateSupportedRegion - Returns a random AWS
 // region that supports Fargate.
@@ -32,6 +40,8 @@ func getRandomFargateSupportedRegion() string {
 }
 
 func createEcsFargateCluster(t *testing.T, awsSession *session.Session, name string) ecs.Cluster {
+	logging.Logger.Infof("Creating ECS cluster %s in region %s", name, *awsSession.Config.Region)
+
 	svc := ecs.New(awsSession)
 	result, err := svc.CreateCluster(&ecs.CreateClusterInput{ClusterName: awsgo.String(name)})
 	if err != nil {
@@ -104,9 +114,24 @@ func createEcsService(t *testing.T, awsSession *session.Session, serviceName str
 		createServiceParams.SetNetworkConfiguration(networkConfiguration)
 	}
 	result, err := svc.CreateService(createServiceParams)
-	if err != nil {
-		assert.Fail(t, gruntworkerrors.WithStackTrace(err).Error())
-	}
+	require.NoError(t, err)
+
+	// Wait for the service to come up before continuing. We try at most two times to wait for the service. Oftentimes
+	// the service wait times out on the first try, but eventually succeeds.
+	retry.DoWithRetry(
+		t,
+		fmt.Sprintf("Waiting for service %s to be stable", awsgo.StringValue(result.Service.ServiceArn)),
+		2,
+		0*time.Second,
+		func() (string, error) {
+			err := svc.WaitUntilServicesStable(&ecs.DescribeServicesInput{
+				Cluster:  cluster.ClusterArn,
+				Services: []*string{result.Service.ServiceArn},
+			})
+			return "", err
+		},
+	)
+
 	return *result.Service
 }
 
@@ -286,9 +311,16 @@ func getVpcConfiguration(awsSession *session.Session) (ecs.AwsVpcConfiguration, 
 	}
 	var subnetIds []*string
 	for _, subnet := range subnets.Subnets {
-		subnetIds = append(subnetIds, subnet.SubnetId)
+		// Only use public subnets for testing simplicity
+		if !collections.ListContainsElement(AvailabilityZoneBlackList, awsgo.StringValue(subnet.AvailabilityZone)) && awsgo.BoolValue(subnet.MapPublicIpOnLaunch) {
+			subnetIds = append(subnetIds, subnet.SubnetId)
+		}
 	}
-	return ecs.AwsVpcConfiguration{Subnets: subnetIds}, nil
+	vpcConfig := ecs.AwsVpcConfiguration{
+		Subnets:        subnetIds,
+		AssignPublicIp: awsgo.String(ecs.AssignPublicIpEnabled),
+	}
+	return vpcConfig, nil
 }
 
 const ECS_ASSUME_ROLE_POLICY = `{
